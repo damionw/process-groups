@@ -1,0 +1,10 @@
+#! /usr/bin/env bash
+
+export PATH="$(dirname "$(dirname "$(readlink -f "${BASH_SOURCE}")")"):${PATH}"
+domain="$(dirname "$(dirname "$(readlink -f "${BASH_SOURCE}")")")/.groups"
+hash -r
+
+pgroup \
+    --domain="${domain}" \
+    --group=TEST_GROUP \
+    --halt

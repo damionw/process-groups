@@ -1,0 +1,918 @@
+#! /usr/bin/env bash
+
+#===================================================================================
+#                                   Contants
+#===================================================================================
+DEFAULT_DOMAIN_FOLDER="${HOME}/.pgroup_domain"
+INTERSTITIAL=15
+VERSION=0.2
+
+#===================================================================================
+#                                Message handling
+#===================================================================================
+message() {
+    local _retval=$?
+    echo -e "$(date '+%Y-%m-%d %H:%M:%S'): $*" >&2
+    return $_retval
+}
+
+abort() {
+    message "$*"
+    exit 255
+}
+
+#===================================================================================
+#                                 Filters
+#===================================================================================
+filter_symbolic() {
+    grep '^[0-9a-zA-Z_][0-9a-zA-Z_]*$'
+}
+
+filter_numeric() {
+    grep '^[0-9][0-9]*$'
+}
+
+#===================================================================================
+#                            Filesystem structure functions
+#===================================================================================
+get_parent_process() {
+    local _ppid
+    local _pid="${1}"
+    
+    _ppid=$(awk '/^PPid[\:]/ {print $NF;}' < /proc/${_pid}/status) &&
+    echo "${_ppid}"
+}
+
+get_shell() {
+    which bash
+}
+
+get_subfolder_list() {
+    local _folder="${1}"
+    find "${_folder}" -mindepth 1 -maxdepth 1 -type d -printf "%f\n" 2>/dev/null
+}
+
+get_supervisor_folder() {
+    local _group_folder="${1}"
+    echo "${_group_folder}/supervisor"
+}
+
+get_tasks_folder() {
+    local _group_folder="${1}"
+    echo "${_group_folder}/tasks"
+}
+
+get_supervisor_log() {
+    local _filename _supervisor_folder
+    local _group_folder="${1}"
+
+    _supervisor_folder="$(get_supervisor_folder "${_group_folder}")" &&
+    _filename="${_supervisor_folder}/supervisor.log" &&
+    echo "${_filename}"
+}
+
+get_pidfile_for_supervisor() {
+    local _filename _supervisor_folder
+    local _group_folder="${1}"
+
+    _supervisor_folder="$(get_supervisor_folder "${_group_folder}")" &&
+    _filename="${_supervisor_folder}/pid" &&
+    echo "${_filename}"
+}
+
+get_dependency_file_for_supervisor() {
+    local _filename _supervisor_folder
+    local _group_folder="${1}"
+    
+    _supervisor_folder="$(get_supervisor_folder "${_group_folder}")" &&
+    _filename="${_supervisor_folder}/dependencies" &&
+    echo "${_filename}"
+}
+
+get_dependencies_for_supervisor() {
+    local _dependency_file _pid
+    local _group_folder="${1}"
+
+    #---------------------------------------------
+    # This list is self pruning for dead processes
+    #---------------------------------------------
+    if ! _dependency_file="$(get_dependency_file_for_supervisor "${_group_folder}")"
+    then
+        :
+    elif [ ! -f "${_dependency_file}" ]
+    then
+        :
+    else
+        sort -un < "${_dependency_file}" 2>/dev/null |
+        filter_numeric |
+        while read _pid
+        do
+            if is_process_alive "${_pid}"
+            then
+                echo "${_pid}"
+            fi
+        done
+    fi
+}
+
+get_registered_tasks() {
+    local _tasks_folder
+    local _group_folder="${1}"
+
+    _tasks_folder="$(get_tasks_folder "${_group_folder}")" &&
+    _names="$(get_subfolder_list "${_tasks_folder}")" &&
+    echo "${_names}"
+}
+
+get_fifo_for_supervisor() {
+    local _supervisor_folder _fifo
+    local _group_folder="${1}"
+    
+    _supervisor_folder="$(get_supervisor_folder "${_group_folder}")" &&
+    _fifo="${_supervisor_folder}/fifo" &&
+    echo "${_fifo}"
+}
+
+get_pid_for_supervisor() {
+    local _pidfile
+    local _group_folder="${1}"
+
+    _pidfile="$(get_pidfile_for_supervisor "${_group_folder}")" &&
+    _pid="$(get_pid_from_file "${_pidfile}")" &&
+    echo "${_pid}"
+}
+
+get_pid_from_file() {
+    local _pid
+    local _pidfile="${1}"
+
+    test -f "${_pidfile}" &&
+    _pid="$(head -1 "${_pidfile}" 2>/dev/null)" &&
+    is_process_alive "${_pid}" &&
+    echo "${_pid}"
+}
+
+get_folder_for_task() {
+    local _folder
+    local _group_folder="${1}"
+    local _id="${2}"
+
+    _folder="$(get_tasks_folder "${_group_folder}")/${_id}" &&
+    echo "${_folder}"
+}
+
+get_pidfile_for_task() {
+    local _task_folder _file
+    local _group_folder="${1}"
+    local _id="${2}"
+    
+    _task_folder="$(get_folder_for_task "${_group_folder}" "${_id}")" &&
+    _file="${_task_folder}/pid" &&
+    echo "${_file}"
+}
+
+get_pid_for_task() {
+    local _pid _pidfile
+    local _group_folder="${1}"
+    local _id="${2}"
+
+    _pidfile="$(get_pidfile_for_task "${_group_folder}" "${_id}")" &&
+    _pid="$(get_pid_from_file "${_pidfile}")" &&
+    echo "${_pid}"
+}
+
+get_scriptfile_for_task() {
+    local _task_folder _script_file
+    local _group_folder="${1}"
+    local _id="${2}"
+
+    _task_folder="$(get_folder_for_task "${_group_folder}" "${_id}")" &&
+    _script_file="${_task_folder}/script" &&
+    echo "${_script_file}"
+}
+
+get_logfile_for_task() {
+    local _task_folder _log_file
+    local _group_folder="${1}"
+    local _id="${2}"
+
+    _task_folder="$(get_folder_for_task "${_group_folder}" "${_id}")" &&
+    _log_file="${_task_folder}/${_id}.log" &&
+    echo "${_log_file}"
+}
+
+#===================================================================================
+#                             Statuses
+#===================================================================================
+is_process_alive() {
+    local _pid="${1}"
+
+    test -n "${_pid}" -a -f "/proc/${_pid}/status"
+}
+
+is_fifo_active() {
+    local _fifo="${1}"
+    local _signal=12 # SIGUSR1
+    local _wait=1
+    local _pid
+
+    if [ ! -p "${_fifo}" ]
+    then
+        message "'${_fifo}' is not a fifo"
+        return 255
+    fi
+
+    (trap 'false' "${_signal}"; _pid=$BASHPID; (sleep 2; kill "-${_signal}" "${_pid}") & echo -n "" > "${_fifo}") >/dev/null 2>&1
+}
+
+#===================================================================================
+#                            Dependency Manipulation
+#===================================================================================
+add_dependencies() {
+    local _dependency_file _pid _contents
+    local _group_folder="${1}"
+    shift
+
+    if _dependency_file="$(get_dependency_file_for_supervisor "${group_folder}")"
+    then
+        _contents="$(
+            get_dependencies_for_supervisor "${_group_folder}"
+
+            for _pid in ${@}
+            do
+                if is_process_alive "${_pid}"
+                then
+                    message "Adding dependency ${_pid}"
+                    echo "${_pid}"
+                else
+                    message "Ignoring non existent dependency ${_pid}"
+                fi
+            done
+        )"
+
+        echo "${_contents}" |
+        sed -e 's/^[ ]*//g' -e 's/[ ]*$//g' -e '/^[ ]*$/d' |
+        sort -nru |
+        cat > "${_dependency_file}"
+    fi
+}
+
+remove_dependencies() {
+    local _file _content _pid
+    local _group_folder="${1}"
+    shift
+
+    _file="$(get_dependency_file_for_supervisor "${group_folder}")" && for _pid in ${@}
+    do
+        message "Removing dependency ${_pid}"
+        _content="$(get_dependencies_for_supervisor "${_group_folder}")"
+        echo "${_content}" | grep -v "^${_pid}"'$' > "${_file}"
+    done
+
+    true
+}
+
+prune_dependencies() {
+    local _new_dependencies _dependency_file
+    local _group_folder="${1}"
+
+    _new_dependencies="$(get_dependencies_for_supervisor "${_group_folder}")" &&
+    _dependency_file="$(get_dependency_file_for_supervisor "${group_folder}")" &&
+    echo "${_new_dependencies}" > "${_dependency_file}" &&
+    test -n "${_new_dependencies}" &&
+    message "Active dependencies: $(echo "${_new_dependencies}" | awk '{printf("%s%s", comma, $1); comma=","}')"
+}
+
+#===================================================================================
+#                           Task Management
+#===================================================================================
+start_task() {
+    local _script_file _task_folder _script _id
+    local _group_folder="${1}"
+    local _parameters="${2}"
+
+    _id="$(echo "${_parameters}" | sed -e 's/[\:].*$//g' | filter_symbolic)"
+    _script="$(echo "${_parameters}" | sed -e 's/^[^\:]*[\:]//g')"
+
+    if [ -z "${_id}" ]
+    then
+        message "Cannot parse task id from '${_parameters}'"
+        return 255
+    elif is_task_running "${_group_folder}" "${_id}"
+    then
+        message "Task '${_id}' is already running"
+        return 255
+    elif ! _script_file="$(get_scriptfile_for_task "${_group_folder}" "${_id}")"
+    then
+        message "Can't get scriptfile for task '${_id}'"
+        return 255
+    elif [ -z "${_script}" ]
+    then
+        if [ -f "${_script_file}" ]
+        then
+            restart_task "${_group_folder}" "${_id}"
+            return $?
+        else
+            message "Cannot execute empty script"
+            return 255
+        fi
+    elif ! _task_folder="$(get_folder_for_task "${_group_folder}" "${_id}")"
+    then
+        message "Can't get folder name for task '${_id}'"
+        return 255
+    elif ! (test -d "${_task_folder}" || mkdir -p "${_task_folder}")
+    then
+        message "Can't create/access folder '${_task_folder}'"
+        return 255
+    elif ! (echo "#! /usr/bin/env bash"; echo "${_script}") > "${_script_file}"
+    then
+        message "Can't write script file '${_script_file}'"
+        return 255
+    elif ! chmod u+x,go-rwx "${_script_file}"
+    then
+        message "Can't change permissions of script file '${_script_file}'"
+        return 255
+    else
+        restart_task "${_group_folder}" "${_id}"
+    fi
+}
+
+restart_task() {
+    local _log_file _script_file _task_folder _pid _pid_file
+    local _group_folder="${1}"
+    local _id="${2}"
+
+    if is_task_running "${_group_folder}" "${_id}"
+    then
+        message "Task '${_id}' is already running"
+        return 255
+    elif ! _script_file="$(get_scriptfile_for_task "${_group_folder}" "${_id}")"
+    then
+        message "Can't get scriptfile for task '${_id}'"
+        return 255
+    elif ! _log_file="$(get_logfile_for_task "${_group_folder}" "${_id}")"
+    then
+        message "Can't get logfile for task '${_id}'"
+        return 255
+    elif ! _pid_file="$(get_pidfile_for_task "${_group_folder}" "${_id}")"
+    then
+        message "Can't get pidfile for task '${_id}'"
+        return 255
+    fi
+
+    echo -e "*** ${_id} restarted on $(date '+%Y-%m-%d %H:%M:%S') ***" >> "${_log_file}"
+    "${_script_file}" </dev/null >>"${_log_file}" 2>&1 10<&- 11>&- 12>&- 13<&- 14>&- & _pid=$!
+    message "(re)Started '${_id}' from '${_script_file}' in process ${_pid}"
+    echo "${_pid}" > "${_pid_file}"
+}
+
+check_tasks() {
+    local _task_folder _id
+    local _group_folder="${1}"
+
+    for _id in $(get_registered_tasks "${_group_folder}")
+    do
+        if ! _task_folder="$(get_folder_for_task "${_group_folder}" "${_id}")"
+        then
+            message "Folder for task '${_id}' doesn't exist"
+        elif is_task_running "${_group_folder}" "${_id}"
+        then
+            message "Task '${_id}' is already running"
+        elif ! restart_task "${_group_folder}" "${_id}"
+        then
+            message "Couldn't restart task ${_id}"
+        fi
+    done
+}
+
+remove_task() {
+    local _task_folder
+    local _group_folder="${1}"
+    local _id="${2}"
+
+    stop_task "${_group_folder}" "${_id}"
+    
+    if ! _task_folder="$(get_folder_for_task "${_group_folder}" "${_id}")"
+    then
+        message "Can't get folder name for task '${_id}'"
+        return 255
+    elif ! rm -rf "${_task_folder}"
+    then
+        message "Can't clean up folder '${_task_folder}'"
+        return 255
+    else
+        message "Removed task folder '${_task_folder}'"
+    fi
+}
+
+stop_task() {
+    local _pid _pid_file
+    local _group_folder="${1}"
+    local _id="${2}"
+
+    if ! _pid="$(get_pid_for_task "${_group_folder}" "${_id}")"
+    then
+        message "Can't get pid for (presumably active) task '${_id}'"
+    else
+        kill "${_pid}"
+    fi
+
+    if ! _pid_file="$(get_pidfile_for_task "${_group_folder}" "${_id}")"
+    then
+        message "Can't get pidfile for task '${_id}'"
+        return 255
+    elif ! rm -f "${_pid_file}" >/dev/null 2>&1
+    then
+        message "Couldn't remove pidfile for task '${_id}'"
+        return 255
+    fi
+
+    message "Stopped task ${_id}"
+}
+
+is_task_running() {
+    local _pid
+    local _group_folder="${1}"
+    local _id="${2}"
+
+    _pid="$(get_pid_for_task "${_group_folder}" "${_id}")" &&
+    is_process_alive "${_pid}"
+}
+
+#===================================================================================
+#                               Supervisor Management
+#===================================================================================
+supervisor() {
+    local _fifo _id _content _request _parameters _log_file
+    local _group_folder="${1}"
+    local _default_countdown="${2}"
+    local _countdown=${_default_countdown}
+    local _pid=$$
+
+    # stdin, stdout & stderr are preserved as descriptors 10, 11, and 12
+    # The folder structure for this process group, in the selected <domain>
+    # is fully populated before we enter this handler
+
+    if ! _log_file="$(get_supervisor_log "${_group_folder}")"
+    then
+        abort "Can't get logfile for supervisor"
+    elif ! _pid_file="$(get_pidfile_for_supervisor "${_group_folder}")"
+    then
+        abort "Can't get fifo for supervisor"
+    elif ! _fifo="$(get_fifo_for_supervisor "${_group_folder}")"
+    then
+        abort "Can't get fifo for supervisor"
+    fi
+
+    # Record the process id
+    echo "${_pid}" > "${_pid_file}"
+
+    # Open the fifo for reading AND writing. Without if
+    # being opened by at least one writer, the read
+    # attempts fail because they're invalid, leading
+    # to lots of cpu time looping
+    exec 13<>"${_fifo}" 14>>"${_log_file}"
+
+    # stdin reads from the fifo, stdout/stderr write to the log
+    exec <&13 >&14 2>&14
+
+    trap 'check_tasks' 20 17 18
+    trap '_countdown=0' 1 2 3 15 # Causes immediate shutdown
+
+    message "Started supervisor in '${_group_folder}' as process ${_pid}"
+
+    while [ -z "${_countdown}" -o "${_countdown:-0}" -gt 0 ]
+    do
+        if read -t ${INTERSTITIAL} _request _parameters
+        then
+            message "Received '${_request}' [${_parameters}] in '${_group_folder}'"
+            _countdown="${_default_countdown}"
+
+            case "${_request}" in
+                ADD_DEPENDENCIES)
+                    add_dependencies "${_group_folder}" ${_parameters}
+                    ;;
+
+                REMOVE_DEPENDENCIES)
+                    remove_dependencies "${_group_folder}" ${_parameters}
+                    ;;
+
+                START_TASK)
+                    start_task "${_group_folder}" "${_parameters}"
+                    ;;
+
+                STOP_TASK)
+                    remove_task "${_group_folder}" "${_parameters}"
+                    ;;
+
+                *)
+                    message "Unhandled request '${_request}' in '${_group_folder}'"
+                    ;;
+            esac
+        elif [ -n "${_countdown}" ] # Only decrement when we're on a shutdown timer
+        then
+            ((--_countdown))
+        fi
+
+        prune_dependencies "${_group_folder}"
+
+        if ! supervisor_has_dependencies "${_group_folder}"
+        then
+            if [ -z "${_countdown}" ]
+            then
+                _countdown=3
+            fi
+
+            message "No active dependencies. Premptible shutdown in $(($_countdown * 10)) seconds"
+        else
+            check_tasks "${_group_folder}"
+        fi
+    done
+
+    # Leave the task folders so that the tasks can be restarted
+    # automatically, but remove the pidfiles !!!
+    for _id in $(get_registered_tasks "${_group_folder}")
+    do
+        stop_task "${_group_folder}" "${_id}"
+    done
+
+    message "Exited supervisor in '${_group_folder}'"
+}
+
+start_supervisor() {
+    # Start a supervisor instance with no dependencies
+    # waits for at least 30 seconds after the last task
+    # is submitted before testing dependencies
+
+    local _group_folder="${1}"
+    local _group_name="${2}"
+    local _script="${3}"
+    local _iterations="${4}"
+
+    local _supervisor_folder="$(get_supervisor_folder "${_group_folder}")"
+    local _supervisor_fifo="$(get_fifo_for_supervisor "${_group_folder}")"
+    local _tasks_folder="$(get_tasks_folder "${_group_folder}")"
+    local _process_label="${_group_name}::supervisor"
+    local _shell="$(get_shell)"
+
+    if ! [ -d "${_supervisor_folder}" ]
+    then
+        mkdir -p "${_supervisor_folder}" &&
+        mkdir -p "${_tasks_folder}" &&
+        mkfifo --mode=700 "${_supervisor_fifo}" &&
+        message "Created supervisor folder for group '${_group_name}' as '${_supervisor_folder}'" ||
+        abort "Cannot initialise supervisor folder contents'${_supervisor_folder}'"
+    fi
+
+    # This may be superfluous
+    if ! test -d "${_supervisor_folder}"
+    then
+        abort "Cannot use supervisor folder '${_supervisor_folder}'"
+    elif ! test -p "${_supervisor_fifo}"
+    then
+        abort "Cannot access fifo '${_supervisor_fifo}'"
+    fi
+
+    # Start the supervisor in the background, renaming it in the process
+    message "Starting group '${_group_name}' with metadata in '${_group_folder}'"
+    __PGROUP_FOLDER__="${_group_folder}" "${_shell}" -c "exec 10<&0 11>&1 12>&2; exec -a '${_process_label}' '${_shell}' <<< '. ${script} ${_iterations}'" &
+}
+
+send_supervisor_command() {
+    local _fifo _parameters
+    local _group_folder="${1}"
+    local _command="${2}"
+
+    shift 2
+
+    _parameters="${@}" &&
+    _fifo="$(get_fifo_for_supervisor "${group_folder}")" &&
+    is_fifo_active "${_fifo}" &&
+    echo "${_command}" "${_parameters}" > "${_fifo}"
+}
+
+is_supervisor_active() {
+    local _pid _fifo _supervisor_folder
+    local _group_folder="${1}"
+    local _group_name="${2}"
+
+    if ! _supervisor_folder="$(get_supervisor_folder "${_group_folder}")"
+    then
+        return 255
+    elif ! _pid="$(get_pid_for_supervisor "${_group_folder}")"
+    then
+        return 255
+    elif ! _fifo="$(get_fifo_for_supervisor "${_group_folder}")"
+    then
+        return 255
+    elif ! is_process_alive "${_pid}"
+    then
+        return 255
+    elif ! is_fifo_active "${_fifo}"
+    then
+        return 255
+    fi
+
+    true
+}
+
+supervisor_has_dependencies() {
+    local _dependencies _count
+    local _group_folder="${1}"
+
+    _dependencies="$(get_dependencies_for_supervisor "${_group_folder}")" &&
+    _count="$(echo "${_dependencies}" | grep -v '^[ ]*$' | wc -l)" &&
+    test ${_count} -gt 0
+}
+
+supervisor_has_tasks() {
+    local _dependencies _count
+    local _group_folder="${1}"
+
+    _tasks="$(get_registered_tasks "${_group_folder}")" &&
+    _count="$(echo "${_tasks}" | wc -l)" &&
+    test ${_count} -gt 0
+}
+
+#===================================================================================
+#                  Break out if started in supervisor mode
+#===================================================================================
+if [ -n "${__PGROUP_FOLDER__}" ]
+then
+    group_folder="${__PGROUP_FOLDER__}"
+    export __PGROUP_FOLDER__=
+    supervisor "${group_folder}" $@
+    exit 0
+fi
+
+#===================================================================================
+#                        Get Process Hierarchy
+#===================================================================================
+this_pid=$BASHPID
+parent_pid="$(get_parent_process "${this_pid}")"
+super_pid="$(get_parent_process "${parent_pid}")"
+
+#===================================================================================
+#                           Set Defaults
+#===================================================================================
+dependencies_to_prune=()
+dependencies_to_add=()
+tasks_to_start=()
+tasks_to_stop=()
+
+basic_dependency=$super_pid
+# basic_dependency=
+
+halt_group=false
+domain_folder=
+group_name=
+iterations=
+list_type=
+
+#===================================================================================
+#                     Process command line parameters
+#===================================================================================
+showhelp() {
+    showoptions() {
+        echo "[--help]"
+        echo "[--list=[tasks|dependencies|groups]]"
+        echo "[--basic-dependency]"
+        echo "[--depends|--add=<pid>]"
+        echo "[--prune|--forget|-p=<pid>]"
+        echo "[--domain=<domain folder>]"
+        echo "[--iterations=<iteration count>]"
+        echo "[--group=<unique group name>]"
+        echo "[--task=[<label>:]<shell command>"
+    }
+
+    echo Usage: $0 $(showoptions) >&2
+    exit 15
+}
+
+showversion() {
+    echo "${VERSION}"
+    exit 17
+}
+
+#-----------------------------------------------------
+# NOTE: There is a bug in getopts where not specifying
+#       at least one short option will cause the first
+#       non option parameter to be discarded. Here, we
+#       just use -h (help)
+#-----------------------------------------------------
+OPTION_TEMP=$(getopt -a -o hvbt:g:i:p:r:a:f:s:l: --long help,halt,basic-dependency,iterations:,debug,version,group:,stop:,start:,depends:,add:,forget:,prune:,domain:,list:,show: -- "$@")
+
+if [ $? != 0 ]
+then
+    echo "Invalid command line options ${OPTION_TEMP}" >&2
+    exit 15
+fi
+
+if [ $# = 0 ]
+then
+    showhelp
+fi
+
+eval set -- "$OPTION_TEMP"
+
+while true
+do
+    case "$1" in
+        --list|-l|--show)
+            list_type="$2"
+            shift 2
+            ;;
+            
+        --iterations)
+            iterations="$2"
+            shift 2
+            ;;
+
+        --domain|-r)
+            domain_folder="$2"
+            shift 2
+            ;;
+
+        --group|-g)
+            group_name="$2"
+            shift 2
+            ;;
+
+        --halt)
+            halt_group=true
+            shift
+            ;;
+
+        --basic-dependency|-b)
+            # This script's process parent is the shell invoked by the caller, so we
+            # need the parent of our parent to be recorded in this mode
+            basic_dependency="${super_pid}"
+            shift
+            ;;
+
+        --add|--depends|-a)
+            dependencies_to_add[${#dependencies_to_add[@]}]="$2";
+            shift 2
+            ;;
+
+        --prune|--forget|-p)
+            dependencies_to_prune[${#dependencies_to_prune[@]}]="$2";
+            shift 2
+            ;;
+
+        --start|-s)
+            tasks_to_start[${#tasks_to_start[@]}]="$2";
+            shift 2
+            ;;
+
+        --stop|-t)
+            tasks_to_stop[${#tasks_to_stop[@]}]="$2";
+            shift 2
+            ;;
+
+        --version|-v)
+            showversion
+            shift
+            ;;
+
+        --help|-h)
+            showhelp
+            shift
+            ;;
+
+        --)
+            shift
+            break
+            ;;
+    esac
+done
+
+#===================================================================================
+#                                Sanity Checks
+#===================================================================================
+domain_folder="${domain_folder:-"${DEFAULT_DOMAIN_FOLDER}"}"
+script="$(readlink -f "${BASH_SOURCE[0]}")"
+
+if [ -z "${domain_folder}" ]
+then
+    abort "No domain folder was specified"
+elif test -d "${domain_folder}"
+then
+    :
+elif mkdir "${domain_folder}"
+then
+    :
+else
+    abort "Cannot access or create domain in '${domain_folder}'"
+fi
+
+group_folder="${domain_folder}/${group_name}"
+
+# Specific dependencies override
+if [ ${#dependencies_to_add[@]} -lt 1 -a -n "${basic_dependency}" -a ${#tasks_to_start[@]} -gt 0 ]
+then
+    dependencies_to_add[${#dependencies_to_add[@]}]="${basic_dependency}"
+fi
+
+#===================================================================================
+#                              Selections
+#===================================================================================
+if [ -z "${group_name}" ]
+then
+    :
+elif ${halt_group:-false}
+then
+    if ! is_supervisor_active "${group_folder}"
+    then
+        :
+    elif ! pid="$(get_pid_for_supervisor "${group_folder}")"
+    then
+        :
+    elif ! is_process_alive "${pid}"
+    then
+        :
+    else
+        message "Stopping supervisor running as process ${pid}"
+        kill "${pid}"
+    fi
+
+    exit 0
+else
+    # Add dependencies to the process group, starting it if necessary
+    if [ ${#dependencies_to_add[@]} -gt 0 ]
+    then
+        if is_supervisor_active "${group_folder}"
+        then
+            :
+        elif ! supervisor_has_tasks "${group_folder}" && test ${#tasks_to_start[@]} -lt 1
+        then
+            abort "Cannot start a new supervisor without specifying a task list"
+        else
+            start_supervisor "${group_folder}" "${group_name}" "${script}" "${iterations}"
+        fi
+
+        send_supervisor_command "${group_folder}" "ADD_DEPENDENCIES" ${dependencies_to_add[@]}
+    elif ! supervisor_has_dependencies "${group_folder}"
+    then
+        message "Will not start supervisor with no dependencies"
+    elif is_supervisor_active "${group_folder}"
+    then
+        :
+    else
+        start_supervisor "${group_folder}" "${group_name}" "${script}" "${iterations}"
+    fi
+
+    if is_supervisor_active "${group_folder}"
+    then
+        # Start specified tasks, ignore if already running
+        if [ ${#tasks_to_start[@]} -gt 0 ]
+        then
+            for ((_task_index=0; _task_index < ${#tasks_to_start[@]}; ++_task_index))
+            do
+                send_supervisor_command "${group_folder}" "START_TASK" "${tasks_to_start[${_task_index}]}"
+            done
+        fi
+
+        # Remove specified tasks by name, ignore if already stopped
+        if [ ${#tasks_to_stop[@]} -gt 0 ]
+        then
+            for ((_task_index=0; _task_index < ${#tasks_to_stop[@]}; ++_task_index))
+            do
+                send_supervisor_command "${group_folder}" "STOP_TASK" "${tasks_to_stop[${_task_index}]}"
+            done
+        fi
+
+        # Remove dependencies from the process group, without starting it
+        if [ ${#dependencies_to_prune[@]} -gt 0 ]
+        then
+            send_supervisor_command "${group_folder}" "REMOVE_DEPENDENCIES" ${dependencies_to_prune[@]}
+        fi
+    fi
+fi
+
+#===================================================================================
+#                            Handle info requests
+#===================================================================================
+case "${list_type}" in
+    groups)
+        get_subfolder_list "${domain_folder}" | sort
+        ;;
+
+    tasks)
+        if [ -z "${group_name}" ]
+        then
+            message "Group name must be specified for task list"
+        else
+            get_registered_tasks "${group_folder}"
+        fi
+        ;;
+
+    dependencies)
+        if [ -z "${group_name}" ]
+        then
+            message "Group name must be specified for dependency list"
+        else
+            get_dependencies_for_supervisor "${group_folder}"
+        fi
+        ;;
+esac
