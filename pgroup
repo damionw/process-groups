@@ -4,7 +4,7 @@
 #                                   Contants
 #===================================================================================
 DEFAULT_DOMAIN_FOLDER="${HOME}/.pgroup_domain"
-INTERSTITIAL=15
+DEFAULT_INTERSTITIAL=15
 VERSION=0.2
 
 #===================================================================================
@@ -206,8 +206,8 @@ get_logfile_for_task() {
 #===================================================================================
 is_process_alive() {
     local _pid="${1}"
-
-    test -n "${_pid}" -a -f "/proc/${_pid}/status"
+    test -n "${_pid}" &&
+    kill -0 "${_pid}" >/dev/null 2>&1
 }
 
 is_fifo_active() {
@@ -445,7 +445,8 @@ is_task_running() {
 supervisor() {
     local _fifo _id _content _request _parameters _log_file
     local _group_folder="${1}"
-    local _default_countdown="${2}"
+    local _wait_time="${2:-${DEFAULT_INTERSTITIAL}}"
+    local _default_countdown="${3}"
     local _countdown=${_default_countdown}
     local _pid=$$
 
@@ -479,11 +480,11 @@ supervisor() {
     trap 'check_tasks' 20 17 18
     trap '_countdown=0' 1 2 3 15 # Causes immediate shutdown
 
-    message "Started supervisor in '${_group_folder}' as process ${_pid}"
+    message "Started supervisor in '${_group_folder}' as process ${_pid} with wait time ${_wait_time}"
 
     while [ -z "${_countdown}" -o "${_countdown:-0}" -gt 0 ]
     do
-        if read -t ${INTERSTITIAL} _request _parameters
+        if read -t ${_wait_time} _request _parameters
         then
             message "Received '${_request}' [${_parameters}] in '${_group_folder}'"
             _countdown="${_default_countdown}"
@@ -523,7 +524,7 @@ supervisor() {
                 _countdown=3
             fi
 
-            message "No active dependencies. Premptible shutdown in $(($_countdown * 10)) seconds"
+            message "No active dependencies. Premptible shutdown in $(($_countdown * ${_wait_time})) seconds"
         else
             check_tasks "${_group_folder}"
         fi
@@ -548,6 +549,7 @@ start_supervisor() {
     local _group_name="${2}"
     local _script="${3}"
     local _iterations="${4}"
+    local _wait_time="${5}"
 
     local _supervisor_folder="$(get_supervisor_folder "${_group_folder}")"
     local _supervisor_fifo="$(get_fifo_for_supervisor "${_group_folder}")"
@@ -575,7 +577,7 @@ start_supervisor() {
 
     # Start the supervisor in the background, renaming it in the process
     message "Starting group '${_group_name}' with metadata in '${_group_folder}'"
-    __PGROUP_FOLDER__="${_group_folder}" "${_shell}" -c "exec 10<&0 11>&1 12>&2; exec -a '${_process_label}' '${_shell}' <<< '. ${script} ${_iterations}'" &
+    __PGROUP_FOLDER__="${_group_folder}" "${_shell}" -c "exec 10<&0 11>&1 12>&2; exec -a '${_process_label}' '${_shell}' <<< '. ${script} ${_wait_time} ${_iterations}'" &
 }
 
 send_supervisor_command() {
@@ -681,6 +683,7 @@ showhelp() {
         echo "[--prune|--forget|-p=<pid>]"
         echo "[--domain=<domain folder>]"
         echo "[--iterations=<iteration count>]"
+        echo "[--wait|-w=<seconds>]"
         echo "[--group=<unique group name>]"
         echo "[--task=[<label>:]<shell command>"
     }
@@ -700,7 +703,7 @@ showversion() {
 #       non option parameter to be discarded. Here, we
 #       just use -h (help)
 #-----------------------------------------------------
-OPTION_TEMP=$(getopt -a -o hvbt:g:i:p:r:a:f:s:l: --long help,halt,basic-dependency,iterations:,debug,version,group:,stop:,start:,depends:,add:,forget:,prune:,domain:,list:,show: -- "$@")
+OPTION_TEMP=$(getopt -a -o hvbt:g:i:p:r:a:f:s:l:w: --long help,halt,basic-dependency,iterations:,wait:,debug,version,group:,stop:,start:,depends:,add:,forget:,prune:,domain:,list:,show: -- "$@")
 
 if [ $? != 0 ]
 then
@@ -723,6 +726,11 @@ do
             shift 2
             ;;
             
+        --wait|-w)
+            wait_time="$2"
+            shift 2
+            ;;
+
         --iterations)
             iterations="$2"
             shift 2
@@ -791,6 +799,7 @@ done
 #                                Sanity Checks
 #===================================================================================
 domain_folder="${domain_folder:-"${DEFAULT_DOMAIN_FOLDER}"}"
+wait_time="${wait_time:-${DEFAULT_INTERSTITIAL}}"
 script="$(readlink -f "${BASH_SOURCE[0]}")"
 
 if [ -z "${domain_folder}" ]
@@ -848,7 +857,7 @@ else
         then
             abort "Cannot start a new supervisor without specifying a task list"
         else
-            start_supervisor "${group_folder}" "${group_name}" "${script}" "${iterations}"
+            start_supervisor "${group_folder}" "${group_name}" "${script}" "${iterations}" "${wait_time}"
         fi
 
         send_supervisor_command "${group_folder}" "ADD_DEPENDENCIES" ${dependencies_to_add[@]}
@@ -859,7 +868,7 @@ else
     then
         :
     else
-        start_supervisor "${group_folder}" "${group_name}" "${script}" "${iterations}"
+        start_supervisor "${group_folder}" "${group_name}" "${script}" "${iterations}" "${wait_time}"
     fi
 
     if is_supervisor_active "${group_folder}"
