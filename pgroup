@@ -3,9 +3,10 @@
 #===================================================================================
 #                                   Contants
 #===================================================================================
-DEFAULT_DOMAIN_FOLDER="${HOME}/.pgroup_domain"
-DEFAULT_INTERSTITIAL=15
-VERSION=0.2
+DOMAINS_ROOT_FOLDER="${HOME}/.pgroup_domains"
+DEFAULT_DOMAIN_NAME="default"
+DEFAULT_INTERSTITIAL=10
+VERSION=0.4
 
 #===================================================================================
 #                                Message handling
@@ -32,6 +33,28 @@ filter_numeric() {
     grep '^[0-9][0-9]*$'
 }
 
+get_rename_list()
+{
+    local archive_ext='.'
+    local name_root="${1}"
+    local limit="${2}"
+    test -f "${name_root}" || return
+    local index=1
+    echo "mv '${name_root}' '${name_root}${archive_ext}${index}'"
+
+    while test -f "${name_root}${archive_ext}${index}"
+    do
+        oldindex=$index
+        ((++index))
+        echo "mv '${name_root}${archive_ext}${oldindex}' '${name_root}${archive_ext}${index}'"
+
+        if [ -n $limit -a $index -gt $limit ]
+        then
+            break
+        fi
+    done
+}
+
 #===================================================================================
 #                            Filesystem structure functions
 #===================================================================================
@@ -49,7 +72,7 @@ get_shell() {
 
 get_subfolder_list() {
     local _folder="${1}"
-    find "${_folder}" -mindepth 1 -maxdepth 1 -type d -printf "%f\n" 2>/dev/null
+    find "${_folder}" -mindepth 1 -maxdepth 1 -type d ! -name '.*' -printf "%f\n" 2>/dev/null
 }
 
 get_supervisor_folder() {
@@ -67,7 +90,10 @@ get_supervisor_log() {
     local _group_folder="${1}"
 
     _supervisor_folder="$(get_supervisor_folder "${_group_folder}")" &&
-    _filename="${_supervisor_folder}/supervisor.log" &&
+    _filename="${_supervisor_folder}/supervisor.log" ||
+    return 255
+
+    get_rename_list "${_filename}" 5 | tac | sh
     echo "${_filename}"
 }
 
@@ -192,13 +218,16 @@ get_scriptfile_for_task() {
 }
 
 get_logfile_for_task() {
-    local _task_folder _log_file
+    local _task_folder _filename
     local _group_folder="${1}"
     local _id="${2}"
 
     _task_folder="$(get_folder_for_task "${_group_folder}" "${_id}")" &&
-    _log_file="${_task_folder}/${_id}.log" &&
-    echo "${_log_file}"
+    _filename="${_task_folder}/${_id}.log" ||
+    return 255
+
+    get_rename_list "${_filename}" 2 | tac | sh
+    echo "${_filename}"
 }
 
 #===================================================================================
@@ -207,7 +236,8 @@ get_logfile_for_task() {
 is_process_alive() {
     local _pid="${1}"
     test -n "${_pid}" &&
-    kill -0 "${_pid}" >/dev/null 2>&1
+    kill -0 "${_pid}" >/dev/null 2>&1 || # Can't send signal to processes for other users
+    test -e /proc/${_pid}/status
 }
 
 is_fifo_active() {
@@ -414,7 +444,8 @@ stop_task() {
     then
         message "Can't get pid for (presumably active) task '${_id}'"
     else
-        kill "${_pid}"
+        message "Sending SIGHUP to process ${_pid}"
+        kill -HUP "${_pid}"
     fi
 
     if ! _pid_file="$(get_pidfile_for_task "${_group_folder}" "${_id}")"
@@ -427,7 +458,7 @@ stop_task() {
         return 255
     fi
 
-    message "Stopped task ${_id}"
+    message "Stopped task ${_id} running as pid ${_pid}"
 }
 
 is_task_running() {
@@ -472,7 +503,7 @@ supervisor() {
     # being opened by at least one writer, the read
     # attempts fail because they're invalid, leading
     # to lots of cpu time looping
-    exec 13<>"${_fifo}" 14>>"${_log_file}"
+    exec 13<>"${_fifo}" 14>"${_log_file}"
 
     # stdin reads from the fifo, stdout/stderr write to the log
     exec <&13 >&14 2>&14
@@ -534,6 +565,7 @@ supervisor() {
     # automatically, but remove the pidfiles !!!
     for _id in $(get_registered_tasks "${_group_folder}")
     do
+        message "Attempting to stop task ${_id}"
         stop_task "${_group_folder}" "${_id}"
     done
 
@@ -559,19 +591,18 @@ start_supervisor() {
 
     if ! [ -d "${_supervisor_folder}" ]
     then
-        mkdir -p "${_supervisor_folder}" &&
-        mkdir -p "${_tasks_folder}" &&
-        mkfifo --mode=700 "${_supervisor_fifo}" &&
+        mkdir -p "${_supervisor_folder}" "${_tasks_folder}" &&
         message "Created supervisor folder for group '${_group_name}' as '${_supervisor_folder}'" ||
         abort "Cannot initialise supervisor folder contents'${_supervisor_folder}'"
     fi
 
-    # This may be superfluous
-    if ! test -d "${_supervisor_folder}"
+    if [ -p "${_supervisor_fifo}" ]
     then
-        abort "Cannot use supervisor folder '${_supervisor_folder}'"
-    elif ! test -p "${_supervisor_fifo}"
+        :
+    elif mkfifo --mode=700 "${_supervisor_fifo}"
     then
+        abort "Created supervisor fifo '${_supervisor_fifo}'"
+    else
         abort "Cannot access fifo '${_supervisor_fifo}'"
     fi
 
@@ -588,8 +619,9 @@ send_supervisor_command() {
     shift 2
 
     _parameters="${@}" &&
-    _fifo="$(get_fifo_for_supervisor "${group_folder}")" &&
+    _fifo="$(get_fifo_for_supervisor "${_group_folder}")" &&
     is_fifo_active "${_fifo}" &&
+    # message "Sending [${_command} ${_parameters}]" &&
     echo "${_command}" "${_parameters}" > "${_fifo}"
 }
 
@@ -662,11 +694,11 @@ dependencies_to_add=()
 tasks_to_start=()
 tasks_to_stop=()
 
-basic_dependency=$super_pid
-# basic_dependency=
-
+basic_dependency=${parent_pid}
+start_all_groups=false
 halt_group=false
-domain_folder=
+
+domain_name=
 group_name=
 iterations=
 list_type=
@@ -678,6 +710,7 @@ showhelp() {
     showoptions() {
         echo "[--help]"
         echo "[--list=[tasks|dependencies|groups]]"
+        echo "[--launch]"
         echo "[--basic-dependency]"
         echo "[--depends|--add=<pid>]"
         echo "[--prune|--forget|-p=<pid>]"
@@ -703,7 +736,7 @@ showversion() {
 #       non option parameter to be discarded. Here, we
 #       just use -h (help)
 #-----------------------------------------------------
-OPTION_TEMP=$(getopt -a -o hvbt:g:i:p:r:a:f:s:l:w: --long help,halt,basic-dependency,iterations:,wait:,debug,version,group:,stop:,start:,depends:,add:,forget:,prune:,domain:,list:,show: -- "$@")
+OPTION_TEMP=$(getopt -a -o hvbt:g:i:p:r:a:f:s:l:w: --long help,launch,halt,basic-dependency,iterations:,wait:,debug,version,group:,stop:,start:,depends:,add:,forget:,prune:,domain:,list:,show: -- "$@")
 
 if [ $? != 0 ]
 then
@@ -721,6 +754,11 @@ eval set -- "$OPTION_TEMP"
 while true
 do
     case "$1" in
+        --launch)
+            start_all_groups=true
+            shift
+            ;;
+
         --list|-l|--show)
             list_type="$2"
             shift 2
@@ -737,7 +775,7 @@ do
             ;;
 
         --domain|-r)
-            domain_folder="$2"
+            domain_name="$2"
             shift 2
             ;;
 
@@ -754,7 +792,7 @@ do
         --basic-dependency|-b)
             # This script's process parent is the shell invoked by the caller, so we
             # need the parent of our parent to be recorded in this mode
-            basic_dependency="${super_pid}"
+            basic_dependency="${parent_pid}"
             shift
             ;;
 
@@ -798,17 +836,18 @@ done
 #===================================================================================
 #                                Sanity Checks
 #===================================================================================
-domain_folder="${domain_folder:-"${DEFAULT_DOMAIN_FOLDER}"}"
+domain_name="$(echo "${domain_name:-"${DEFAULT_DOMAIN_NAME}"}" | sed -e 's/^.*[\/]//g')"
+domain_folder="${DOMAINS_ROOT_FOLDER}/${domain_name}"
 wait_time="${wait_time:-${DEFAULT_INTERSTITIAL}}"
 script="$(readlink -f "${BASH_SOURCE[0]}")"
 
 if [ -z "${domain_folder}" ]
 then
     abort "No domain folder was specified"
-elif test -d "${domain_folder}"
+elif test -d "$(readlink -f "${domain_folder}")"
 then
-    :
-elif mkdir "${domain_folder}"
+    domain_folder="$(readlink -f "${domain_folder}")"
+elif mkdir -p "${domain_folder}"
 then
     :
 else
@@ -826,7 +865,34 @@ fi
 #===================================================================================
 #                              Selections
 #===================================================================================
-if [ -z "${group_name}" ]
+if ${start_all_groups:-false}
+then
+    if [ ${#dependencies_to_add[@]} -lt 1 -a -n "${basic_dependency}" ]
+    then
+        dependencies_to_add[${#dependencies_to_add[@]}]="${basic_dependency}"
+    fi
+
+    message "Starting all process groups in domain '${domain_folder}' [${dependencies_to_add[@]}]"
+
+    for launch_group_name in $(get_subfolder_list "${domain_folder}" | sort)
+    do
+        launch_group_folder="${domain_folder}/${launch_group_name}"
+
+        if is_supervisor_active "${launch_group_folder}"
+        then
+            message "${launch_group_name} process group is already running"
+        else
+            start_supervisor "${launch_group_folder}" "${launch_group_name}" "${script}" "${iterations}" "${wait_time}"
+        fi
+
+        if [ ${#dependencies_to_add[@]} -gt 0 ]
+        then
+            send_supervisor_command "${launch_group_folder}" "ADD_DEPENDENCIES" ${dependencies_to_add[@]}
+        fi
+    done
+
+    exit 0
+elif [ -z "${group_name}" ]
 then
     :
 elif ${halt_group:-false}
@@ -863,7 +929,7 @@ else
         send_supervisor_command "${group_folder}" "ADD_DEPENDENCIES" ${dependencies_to_add[@]}
     elif ! supervisor_has_dependencies "${group_folder}"
     then
-        message "Will not start supervisor with no dependencies"
+        : # message "Will not start supervisor with no dependencies"
     elif is_supervisor_active "${group_folder}"
     then
         :
@@ -903,6 +969,10 @@ fi
 #                            Handle info requests
 #===================================================================================
 case "${list_type}" in
+    domains)
+        get_subfolder_list "${DOMAINS_ROOT_FOLDER}" | sort
+        ;;
+
     groups)
         get_subfolder_list "${domain_folder}" | sort
         ;;
