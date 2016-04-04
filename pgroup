@@ -3,10 +3,9 @@
 #===================================================================================
 #                                   Contants
 #===================================================================================
-DOMAINS_ROOT_FOLDER="${HOME}/.pgroup_domains"
 DEFAULT_DOMAIN_NAME="default"
 DEFAULT_INTERSTITIAL=10
-VERSION=0.4
+VERSION=0.5
 
 #===================================================================================
 #                                Message handling
@@ -589,10 +588,13 @@ start_supervisor() {
     local _process_label="${_group_name}::supervisor"
     local _shell="$(get_shell)"
 
-    if ! [ -d "${_supervisor_folder}" ]
+    if [ -d "${_supervisor_folder}" ]
     then
-        mkdir -p "${_supervisor_folder}" "${_tasks_folder}" &&
-        message "Created supervisor folder for group '${_group_name}' as '${_supervisor_folder}'" ||
+        :
+    elif mkdir -p "${_supervisor_folder}" "${_tasks_folder}"
+    then
+        message "Created supervisor folder for group '${_group_name}' as '${_supervisor_folder}'"
+    else
         abort "Cannot initialise supervisor folder contents'${_supervisor_folder}'"
     fi
 
@@ -601,7 +603,7 @@ start_supervisor() {
         :
     elif mkfifo --mode=700 "${_supervisor_fifo}"
     then
-        abort "Created supervisor fifo '${_supervisor_fifo}'"
+        message "Created supervisor fifo '${_supervisor_fifo}'"
     else
         abort "Cannot access fifo '${_supervisor_fifo}'"
     fi
@@ -698,6 +700,7 @@ basic_dependency=${parent_pid}
 start_all_groups=false
 halt_group=false
 
+root_folder="${HOME}/.pgroup_domains"
 domain_name=
 group_name=
 iterations=
@@ -714,11 +717,14 @@ showhelp() {
         echo "[--basic-dependency]"
         echo "[--depends|--add=<pid>]"
         echo "[--prune|--forget|-p=<pid>]"
-        echo "[--domain=<domain folder>]"
+        echo "[--domain|-d=<domain folder>]"
         echo "[--iterations=<iteration count>]"
         echo "[--wait|-w=<seconds>]"
         echo "[--group=<unique group name>]"
-        echo "[--task=[<label>:]<shell command>"
+        echo "[--start=<label>:<shell command>"
+        echo "[--restart=<label>"
+        echo "[--root-folder=<folder>"
+        echo "[--stop=<label>"
     }
 
     echo Usage: $0 $(showoptions) >&2
@@ -736,7 +742,7 @@ showversion() {
 #       non option parameter to be discarded. Here, we
 #       just use -h (help)
 #-----------------------------------------------------
-OPTION_TEMP=$(getopt -a -o hvbt:g:i:p:r:a:f:s:l:w: --long help,launch,halt,basic-dependency,iterations:,wait:,debug,version,group:,stop:,start:,depends:,add:,forget:,prune:,domain:,list:,show: -- "$@")
+OPTION_TEMP=$(getopt -a -o hvbt:g:i:p:r:a:f:s:l:w:r: --long help,launch,halt,basic-dependency,iterations:,wait:,debug,version,group:,stop:,start:,restart:,depends:,add:,forget:,prune:,domain:,list:,show:,root-folder: -- "$@")
 
 if [ $? != 0 ]
 then
@@ -774,13 +780,18 @@ do
             shift 2
             ;;
 
-        --domain|-r)
+        --domain|-d)
             domain_name="$2"
             shift 2
             ;;
 
         --group|-g)
             group_name="$2"
+            shift 2
+            ;;
+
+        --root-folder)
+            root_folder="$2"
             shift 2
             ;;
 
@@ -803,6 +814,12 @@ do
 
         --prune|--forget|-p)
             dependencies_to_prune[${#dependencies_to_prune[@]}]="$2";
+            shift 2
+            ;;
+
+        --restart|-r)
+            tasks_to_start[${#tasks_to_start[@]}]="$2";
+            tasks_to_stop[${#tasks_to_stop[@]}]="$2";
             shift 2
             ;;
 
@@ -837,7 +854,7 @@ done
 #                                Sanity Checks
 #===================================================================================
 domain_name="$(echo "${domain_name:-"${DEFAULT_DOMAIN_NAME}"}" | sed -e 's/^.*[\/]//g')"
-domain_folder="${DOMAINS_ROOT_FOLDER}/${domain_name}"
+domain_folder="${root_folder}/${domain_name}"
 wait_time="${wait_time:-${DEFAULT_INTERSTITIAL}}"
 script="$(readlink -f "${BASH_SOURCE[0]}")"
 
@@ -880,7 +897,7 @@ then
 
         if is_supervisor_active "${launch_group_folder}"
         then
-            message "${launch_group_name} process group is already running"
+                message "${launch_group_name} process group is already running"
         else
             start_supervisor "${launch_group_folder}" "${launch_group_name}" "${script}" "${iterations}" "${wait_time}"
         fi
@@ -939,21 +956,21 @@ else
 
     if is_supervisor_active "${group_folder}"
     then
-        # Start specified tasks, ignore if already running
-        if [ ${#tasks_to_start[@]} -gt 0 ]
-        then
-            for ((_task_index=0; _task_index < ${#tasks_to_start[@]}; ++_task_index))
-            do
-                send_supervisor_command "${group_folder}" "START_TASK" "${tasks_to_start[${_task_index}]}"
-            done
-        fi
-
         # Remove specified tasks by name, ignore if already stopped
         if [ ${#tasks_to_stop[@]} -gt 0 ]
         then
             for ((_task_index=0; _task_index < ${#tasks_to_stop[@]}; ++_task_index))
             do
                 send_supervisor_command "${group_folder}" "STOP_TASK" "${tasks_to_stop[${_task_index}]}"
+            done
+        fi
+
+        # Start specified tasks, ignore if already running
+        if [ ${#tasks_to_start[@]} -gt 0 ]
+        then
+            for ((_task_index=0; _task_index < ${#tasks_to_start[@]}; ++_task_index))
+            do
+                send_supervisor_command "${group_folder}" "START_TASK" "${tasks_to_start[${_task_index}]}"
             done
         fi
 
@@ -970,7 +987,7 @@ fi
 #===================================================================================
 case "${list_type}" in
     domains)
-        get_subfolder_list "${DOMAINS_ROOT_FOLDER}" | sort
+        get_subfolder_list "${root_folder}" | sort
         ;;
 
     groups)
@@ -984,6 +1001,13 @@ case "${list_type}" in
         else
             get_registered_tasks "${group_folder}"
         fi
+        ;;
+
+    status)
+        for _id in $(get_registered_tasks "${group_folder}")
+        do
+            echo "${_id}=$(is_task_running "${group_folder}" "${_id}" && echo running || echo stopped)"
+        done
         ;;
 
     dependencies)

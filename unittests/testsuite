@@ -1,0 +1,132 @@
+#! /usr/bin/env bash
+
+#===================================================================================
+#                                Message handling
+#===================================================================================
+message() {
+    local _retval=$?
+    echo -e "$*" >&2
+    return $_retval
+}
+
+abort() {
+    message "$*"
+    exit 255
+}
+
+#===================================================================================
+#                                    Unittests
+#===================================================================================
+test_basic() {
+    echo -n "Testing initial task creation..."
+
+    $pgroup_command \
+        --add="${dependency_pid}" \
+        --start="unittest_task:date; sleep 30; echo 'EXITING'" || retval=$?
+
+    status=$?
+
+    if [ $status = 0 ]
+    then
+        echo "success"
+    else
+        echo "failed"
+        return $status
+    fi
+
+    echo -n "Testing created group..."
+
+    if [ $($pgroup_command --list=groups) = "unittest_group" ]
+    then
+        echo "success"
+    else
+        echo "failed"
+        return 255
+    fi
+
+    echo -n "Testing active dependencies..."
+
+    if [ $($pgroup_command --list=dependencies) = "$dependency_pid" ]
+    then
+        echo "success"
+    else
+        echo "failed"
+        return 255
+    fi
+
+    echo -n "Testing running tasks..."
+
+    if [ $($pgroup_command --list=status) = "unittest_task=running" ]
+    then
+        echo "success"
+    else
+        echo "failed"
+        return 255
+    fi
+
+    echo -n "Testing dependency removal..."
+
+    $pgroup_command --prune="${dependency_pid}"
+    
+    if [ "$($pgroup_command --list=dependencies)" = "" ]
+    then
+        echo "success"
+    else
+        echo "failed"
+        return 255
+    fi
+
+    echo -n "Testing automatic task shutdown..."
+
+    for countdown in 5 4 3 2 1
+    do
+        test $($pgroup_command --list=status) = "unittest_task=stopped" && status=0 && break || status=$?
+        sleep 2
+        echo -n "."
+    done
+
+    if [ $status = 0 ]
+    then
+        echo "success"
+    else
+        echo "failed"
+        return $status
+    fi
+}
+
+test_void() {
+    true
+}
+
+#===================================================================================
+#                                Execution
+#===================================================================================
+if ! root_folder="$(mktemp -d)"
+then
+    abort "Cannot create unittest domain root folder"
+else
+    use_temp=true
+fi
+
+dependency_pid=$$
+pgroup_command="$(which pgroup) --root-folder=${root_folder} --domain=unittest_domain --group=unittest_group --wait=2"
+localdir="$(dirname "$(readlink -f "${BASH_SOURCE}")")"
+unittest_functions="$(declare -f | grep '^test_' | sed -e 's/[ ].*$//g')"
+hash -r
+
+for test_name in $unittest_functions
+do
+    ${firsttime:-true} && firstime=false || message ""
+    message "Running in [${test_name}]"
+    $test_name && message "Succeeded in [${test_name}]" && status=0 && continue || status=$?
+    message "Failed in [${test_name}]"
+    break
+done
+
+if $use_temp && test -d "${root_folder}"
+then
+    message "Cleaning up in '${root_folder}'"
+    rm -rf "${root_folder}"
+fi
+
+exit $status
