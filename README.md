@@ -17,6 +17,11 @@ can be managed in isolation using 'domains'
 The help text, unittests, and included examples should provide good instruction
 on how to use the tool
 
+## Platform
+
+Currently, this package required bash, awk, etc plus an OS with /proc/... Typically
+this means some flavour of modern Linux
+
 ## License
 
 process-groups is licensed under the terms of the GNU GPLv2 License. See the LICENSE file
