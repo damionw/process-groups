@@ -1,5 +1,7 @@
 # process-groups - A reference counting process group supervisor
 
+This project is obsoleted by https://github.com/damionw/suites
+
 [Process Groups](https://github.com/damionw/process-groups) implements
 a process group supervision model where the group of tasks is started
 when there exist one or more external dependent processes and is stopped
